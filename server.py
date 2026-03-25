@@ -7,56 +7,67 @@ import io
 import os
 import sys
 import contextlib
+import threading
 import requests
 from fastmcp import FastMCP
 
 mcp = FastMCP("Roboflow")
 
 # ---------------------------------------------------------------------------
-# Lazy SDK init — authenticate once per session, suppress stdout
+# Lazy SDK init — authenticate once per session, suppress output
 # (Roboflow SDK prints to stdout on init which corrupts MCP stdio transport)
 # ---------------------------------------------------------------------------
 
 _rf = None
 _ws = None
+_init_lock = threading.Lock()
 
 
 @contextlib.contextmanager
-def _suppress_stdout():
-    old = sys.stdout
+def _suppress_output():
+    """Redirect stdout and stderr during SDK calls to protect the MCP stdio transport."""
+    old_out, old_err = sys.stdout, sys.stderr
     sys.stdout = io.StringIO()
+    sys.stderr = io.StringIO()
     try:
         yield
     finally:
-        sys.stdout = old
+        sys.stdout = old_out
+        sys.stderr = old_err
 
 
 def get_rf():
+    """Lazy singleton — initializes the Roboflow client once on first call."""
     global _rf
     if _rf is None:
-        api_key = os.environ.get("ROBOFLOW_API_KEY")
-        if not api_key:
-            raise ValueError("ROBOFLOW_API_KEY environment variable is required")
-        import roboflow
-        with _suppress_stdout():
-            _rf = roboflow.Roboflow(api_key=api_key)
+        with _init_lock:
+            if _rf is None:
+                api_key = os.environ.get("ROBOFLOW_API_KEY")
+                if not api_key:
+                    raise ValueError("ROBOFLOW_API_KEY environment variable is required")
+                import roboflow
+                with _suppress_output():
+                    _rf = roboflow.Roboflow(api_key=api_key)
     return _rf
 
 
 def get_ws(workspace_url: str = ""):
+    """Lazy singleton for the default workspace; bypasses cache when workspace_url is given."""
     global _ws
     rf = get_rf()
     if workspace_url:
-        with _suppress_stdout():
+        with _suppress_output():
             return rf.workspace(workspace_url)
     if _ws is None:
-        with _suppress_stdout():
-            _ws = rf.workspace()
+        with _init_lock:
+            if _ws is None:
+                with _suppress_output():
+                    _ws = rf.workspace()
     return _ws
 
 
 # ---------------------------------------------------------------------------
-# Tools
+# Workspace & Project tools
 # ---------------------------------------------------------------------------
 
 
@@ -64,15 +75,12 @@ def get_ws(workspace_url: str = ""):
 def list_workspaces() -> dict:
     """List the workspace accessible with the current API key.
     Returns workspace name, URL slug, and number of projects."""
-    try:
-        ws = get_ws()
-        return {
-            "name": getattr(ws, "name", None),
-            "url": getattr(ws, "url", None),
-            "project_count": len(getattr(ws, "project_list", [])),
-        }
-    except Exception as e:
-        return {"error": type(e).__name__, "message": str(e)}
+    ws = get_ws()
+    return {
+        "name": ws.name,
+        "url": ws.url,
+        "project_count": len(ws.project_list),
+    }
 
 
 @mcp.tool()
@@ -80,21 +88,18 @@ def list_projects(workspace_url: str = "") -> list:
     """List all projects in a workspace.
     Each entry includes project id, name, type, annotation group, and image count.
     Leave workspace_url empty to use the default workspace."""
-    try:
-        ws = get_ws(workspace_url)
-        return [
-            {
-                "id": p.get("id"),
-                "name": p.get("name"),
-                "type": p.get("type"),
-                "annotation": p.get("annotation", ""),
-                "images": p.get("images", 0),
-                "classes": p.get("classes", {}),
-            }
-            for p in getattr(ws, "project_list", [])
-        ]
-    except Exception as e:
-        return [{"error": type(e).__name__, "message": str(e)}]
+    ws = get_ws(workspace_url)
+    return [
+        {
+            "id": p.get("id"),
+            "name": p.get("name"),
+            "type": p.get("type"),
+            "annotation": p.get("annotation", ""),
+            "images": p.get("images", 0),
+            "classes": p.get("classes", {}),
+        }
+        for p in ws.project_list
+    ]
 
 
 @mcp.tool()
@@ -102,40 +107,39 @@ def get_project(project_url: str, workspace_url: str = "") -> dict:
     """Get detailed info about a project: class list, image count, annotation type.
     project_url is the URL slug (e.g. 'my-dataset').
     Leave workspace_url empty for the default workspace."""
-    try:
-        ws = get_ws(workspace_url)
-        with _suppress_stdout():
-            proj = ws.project(project_url)
-        return {
-            "id": getattr(proj, "id", None),
-            "name": getattr(proj, "name", None),
-            "type": getattr(proj, "type", None),
-            "annotation": getattr(proj, "annotation", None),
-            "classes": getattr(proj, "classes", {}),
-        }
-    except Exception as e:
-        return {"error": type(e).__name__, "message": str(e)}
+    ws = get_ws(workspace_url)
+    with _suppress_output():
+        proj = ws.project(project_url)
+    return {
+        "id": proj.id,
+        "name": proj.name,
+        "type": proj.type,
+        "annotation": proj.annotation,
+        "classes": proj.classes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Dataset Version tools
+# ---------------------------------------------------------------------------
 
 
 @mcp.tool()
 def list_versions(project_url: str, workspace_url: str = "") -> list:
     """List all dataset versions for a project.
     Returns version number, id, and image counts per split."""
-    try:
-        ws = get_ws(workspace_url)
-        with _suppress_stdout():
-            proj = ws.project(project_url)
-            versions = proj.versions()
-        return [
-            {
-                "version": getattr(v, "version", None),
-                "id": getattr(v, "id", None),
-                "images": getattr(v, "images", None),
-            }
-            for v in versions
-        ]
-    except Exception as e:
-        return [{"error": type(e).__name__, "message": str(e)}]
+    ws = get_ws(workspace_url)
+    with _suppress_output():
+        proj = ws.project(project_url)
+        versions = proj.versions()
+    return [
+        {
+            "version": v.version,
+            "id": v.id,
+            "images": v.images,
+        }
+        for v in versions
+    ]
 
 
 @mcp.tool()
@@ -152,54 +156,50 @@ def upload_image(
     annotation_path: optional absolute path to annotation file (PASCAL VOC XML, COCO JSON, etc).
     split: 'train', 'valid', or 'test' (default: 'train').
     batch_name: optional batch label for grouping uploads."""
-    try:
-        ws = get_ws(workspace_url)
-        with _suppress_stdout():
-            proj = ws.project(project_url)
-        kwargs = {"split": split, "num_retry_uploads": 2}
-        if annotation_path:
-            kwargs["annotation_path"] = annotation_path
-        if batch_name:
-            kwargs["batch_name"] = batch_name
-        with _suppress_stdout():
-            result = proj.upload(image_path, **kwargs)
-        return {"success": True, "image_path": image_path, "result": str(result)}
-    except Exception as e:
-        return {"error": type(e).__name__, "message": str(e)}
+    if split not in ("train", "valid", "test"):
+        raise ValueError(f"split must be 'train', 'valid', or 'test' — got '{split}'")
+    ws = get_ws(workspace_url)
+    with _suppress_output():
+        proj = ws.project(project_url)
+    kwargs: dict = {"split": split, "num_retry_uploads": 2}
+    if annotation_path:
+        kwargs["annotation_path"] = annotation_path
+    if batch_name:
+        kwargs["batch_name"] = batch_name
+    with _suppress_output():
+        result = proj.upload(image_path, **kwargs)
+    return {"success": True, "image_path": image_path, "result": str(result)}
 
 
 @mcp.tool()
 def create_version(
     project_url: str,
-    preprocessing: dict = {},
-    augmentation: dict = {},
+    preprocessing: dict | None = None,
+    augmentation: dict | None = None,
     workspace_url: str = "",
 ) -> dict:
     """Generate a new dataset version with preprocessing and augmentation settings.
     preprocessing example: {"auto-orient": True, "resize": {"width": 640, "height": 640, "format": "Stretch to"}}
     augmentation example: {"flip": {"horizontal": True}, "rotation": {"degrees": 15}}
     Leave both empty to generate a version with no modifications."""
-    try:
-        ws = get_ws(workspace_url)
-        with _suppress_stdout():
-            proj = ws.project(project_url)
-        settings = {}
-        if preprocessing:
-            settings["preprocessing"] = preprocessing
-        if augmentation:
-            settings["augmentation"] = augmentation
-        with _suppress_stdout():
-            version = proj.generate_version(settings)
-        return {"success": True, "version": str(version)}
-    except Exception as e:
-        return {"error": type(e).__name__, "message": str(e)}
+    ws = get_ws(workspace_url)
+    with _suppress_output():
+        proj = ws.project(project_url)
+    settings: dict = {}
+    if preprocessing:
+        settings["preprocessing"] = preprocessing
+    if augmentation:
+        settings["augmentation"] = augmentation
+    with _suppress_output():
+        version = proj.generate_version(settings)
+    return {"success": True, "version": str(version)}
 
 
 @mcp.tool()
 def download_dataset(
     project_url: str,
     version_number: int,
-    format: str = "yolov8",
+    model_format: str = "yolov8",
     location: str = "",
     workspace_url: str = "",
 ) -> dict:
@@ -207,23 +207,25 @@ def download_dataset(
     Supported formats: yolov8, yolov5, coco, voc, tensorflow, darknet, createml, multiclass.
     Returns the local path where the dataset was saved.
     Leave location empty to download to the current directory."""
-    try:
-        ws = get_ws(workspace_url)
-        with _suppress_stdout():
-            proj = ws.project(project_url)
-            ver = proj.version(version_number)
-        kwargs = {"model_format": format, "overwrite": True}
-        if location:
-            kwargs["location"] = location
-        with _suppress_stdout():
-            dataset = ver.download(**kwargs)
-        return {
-            "location": getattr(dataset, "location", location),
-            "format": format,
-            "version": version_number,
-        }
-    except Exception as e:
-        return {"error": type(e).__name__, "message": str(e)}
+    ws = get_ws(workspace_url)
+    with _suppress_output():
+        proj = ws.project(project_url)
+        ver = proj.version(version_number)
+    kwargs: dict = {"model_format": model_format, "overwrite": True}
+    if location:
+        kwargs["location"] = location
+    with _suppress_output():
+        dataset = ver.download(**kwargs)
+    return {
+        "location": getattr(dataset, "location", location),
+        "format": model_format,
+        "version": version_number,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Roboflow Universe tools
+# ---------------------------------------------------------------------------
 
 
 @mcp.tool()
@@ -231,30 +233,62 @@ def search_universe(query: str, page: int = 1, results_per_page: int = 10) -> li
     """Search Roboflow Universe for public datasets and pre-trained models.
     Returns matching projects with name, URL, type, image count, and class list.
     Great for finding existing datasets before starting annotation from scratch."""
-    try:
-        api_key = os.environ.get("ROBOFLOW_API_KEY", "")
-        resp = requests.get(
-            "https://api.roboflow.com/search",
-            params={"q": query, "page": page, "resultsPerPage": results_per_page},
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        results = data.get("results", [])
-        return [
-            {
-                "name": r.get("name"),
-                "url": r.get("url"),
-                "type": r.get("type"),
-                "images": r.get("images"),
-                "classes": r.get("classes"),
-                "universe_url": f"https://universe.roboflow.com/{r.get('url', '')}",
-            }
-            for r in results
-        ]
-    except Exception as e:
-        return [{"error": type(e).__name__, "message": str(e)}]
+    get_rf()  # ensure auth validated before making the request
+    api_key = os.environ["ROBOFLOW_API_KEY"]
+    resp = requests.get(
+        "https://api.roboflow.com/search",
+        params={"q": query, "page": page, "resultsPerPage": results_per_page},
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    results = resp.json().get("results", [])
+    return [
+        {
+            "name": r.get("name"),
+            "url": r.get("url"),
+            "type": r.get("type"),
+            "images": r.get("images"),
+            "classes": r.get("classes"),
+            "universe_url": f"https://universe.roboflow.com/{r.get('url', '')}",
+        }
+        for r in results
+    ]
+
+
+@mcp.tool()
+def download_universe_dataset(
+    universe_workspace: str,
+    universe_project: str,
+    version_number: int,
+    model_format: str = "yolov8",
+    location: str = "",
+) -> dict:
+    """Download a public dataset from Roboflow Universe directly.
+    universe_workspace: workspace slug on Universe (e.g. 'brad-dwyer').
+    universe_project: project slug (e.g. 'chess-pieces-new').
+    version_number: dataset version to download.
+    Supported formats: yolov8, yolov5, coco, voc, tensorflow, darknet."""
+    rf = get_rf()
+    with _suppress_output():
+        proj = rf.workspace(universe_workspace).project(universe_project)
+        ver = proj.version(version_number)
+    kwargs: dict = {"model_format": model_format, "overwrite": True}
+    if location:
+        kwargs["location"] = location
+    with _suppress_output():
+        dataset = ver.download(**kwargs)
+    return {
+        "location": getattr(dataset, "location", location),
+        "format": model_format,
+        "version": version_number,
+        "source": f"https://universe.roboflow.com/{universe_workspace}/{universe_project}",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Inference & Metrics tools
+# ---------------------------------------------------------------------------
 
 
 @mcp.tool()
@@ -271,17 +305,16 @@ def run_inference(
     confidence: minimum confidence threshold 0-100 (default 50).
     overlap: maximum bounding box overlap 0-100 (default 50).
     Returns predictions with bounding boxes, classes, and confidence scores."""
-    try:
-        ws = get_ws(workspace_url)
-        with _suppress_stdout():
-            proj = ws.project(project_url)
-            ver = proj.version(version_number)
-            model = ver.model
-        with _suppress_stdout():
-            predictions = model.predict(image_path, confidence=confidence, overlap=overlap)
-        return predictions.json()
-    except Exception as e:
-        return {"error": type(e).__name__, "message": str(e)}
+    ws = get_ws(workspace_url)
+    with _suppress_output():
+        proj = ws.project(project_url)
+        ver = proj.version(version_number)
+        model = ver.model
+    if model is None:
+        raise ValueError(f"No trained model found for version {version_number}. Train a model first.")
+    with _suppress_output():
+        predictions = model.predict(image_path, confidence=confidence, overlap=overlap)
+    return predictions.json()
 
 
 @mcp.tool()
@@ -292,62 +325,25 @@ def get_model_metrics(
 ) -> dict:
     """Get model training metrics (mAP, precision, recall) for a trained version.
     Returns performance metrics if the model has been trained on Roboflow."""
-    try:
-        rf = get_rf()
-        api_key = os.environ.get("ROBOFLOW_API_KEY", "")
-        ws_url = workspace_url or getattr(get_ws(), "url", "")
-        resp = requests.get(
-            f"https://api.roboflow.com/{ws_url}/{project_url}/{version_number}",
-            params={"api_key": api_key},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        version_data = data.get("version", {})
-        model_data = version_data.get("model", {})
-        return {
-            "version": version_number,
-            "mAP": model_data.get("map"),
-            "precision": model_data.get("precision"),
-            "recall": model_data.get("recall"),
-            "training_status": version_data.get("training", {}).get("status"),
-        }
-    except Exception as e:
-        return {"error": type(e).__name__, "message": str(e)}
-
-
-@mcp.tool()
-def download_universe_dataset(
-    universe_workspace: str,
-    universe_project: str,
-    version_number: int,
-    format: str = "yolov8",
-    location: str = "",
-) -> dict:
-    """Download a public dataset from Roboflow Universe directly.
-    universe_workspace: workspace slug on Universe (e.g. 'brad-dwyer').
-    universe_project: project slug (e.g. 'chess-pieces-new').
-    version_number: dataset version to download.
-    Supported formats: yolov8, yolov5, coco, voc, tensorflow, darknet."""
-    try:
-        rf = get_rf()
-        api_key = os.environ.get("ROBOFLOW_API_KEY", "")
-        with _suppress_stdout():
-            proj = rf.workspace(universe_workspace).project(universe_project)
-            ver = proj.version(version_number)
-        kwargs = {"model_format": format, "overwrite": True}
-        if location:
-            kwargs["location"] = location
-        with _suppress_stdout():
-            dataset = ver.download(**kwargs)
-        return {
-            "location": getattr(dataset, "location", location),
-            "format": format,
-            "version": version_number,
-            "source": f"https://universe.roboflow.com/{universe_workspace}/{universe_project}",
-        }
-    except Exception as e:
-        return {"error": type(e).__name__, "message": str(e)}
+    get_rf()  # ensure auth validated before making the request
+    api_key = os.environ["ROBOFLOW_API_KEY"]
+    ws_url = workspace_url or get_ws().url
+    resp = requests.get(
+        f"https://api.roboflow.com/{ws_url}/{project_url}/{version_number}",
+        params={"api_key": api_key},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    version_data = data.get("version", {})
+    model_data = version_data.get("model", {})
+    return {
+        "version": version_number,
+        "mAP": model_data.get("map"),
+        "precision": model_data.get("precision"),
+        "recall": model_data.get("recall"),
+        "training_status": version_data.get("training", {}).get("status"),
+    }
 
 
 # ---------------------------------------------------------------------------
