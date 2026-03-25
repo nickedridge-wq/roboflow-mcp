@@ -6,7 +6,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that ex
 
 ## Setup
 
-**Requirements:** Python 3.9+, a Roboflow API key, Claude Code installed.
+**Requirements:** Python 3.10+, a Roboflow API key, Claude Code installed.
 
 ```bash
 git clone https://github.com/nickedridge-wq/roboflow-mcp.git
@@ -18,21 +18,22 @@ pip install -r requirements.txt
 
 ### Configure Claude Code
 
-Add the server to `~/.claude/settings.json`:
+**Option A — project-level** (recommended, checked into the repo):
 
-```json
-{
-  "mcpServers": {
-    "roboflow": {
-      "type": "stdio",
-      "command": "/path/to/roboflow-mcp/venv/bin/python",
-      "args": ["/path/to/roboflow-mcp/server.py"],
-      "env": {
-        "ROBOFLOW_API_KEY": "your_api_key_here"
-      }
-    }
-  }
-}
+```bash
+claude mcp add roboflow \
+  --env ROBOFLOW_API_KEY=your_api_key_here \
+  -- /path/to/roboflow-mcp/venv/bin/python /path/to/roboflow-mcp/server.py
+```
+
+This writes a `.mcp.json` file in the current project directory.
+
+**Option B — user-level** (available in all projects):
+
+```bash
+claude mcp add roboflow --scope user \
+  --env ROBOFLOW_API_KEY=your_api_key_here \
+  -- /path/to/roboflow-mcp/venv/bin/python /path/to/roboflow-mcp/server.py
 ```
 
 Restart Claude Code — the `mcp__roboflow__*` tools will be available immediately.
@@ -69,7 +70,7 @@ download_universe_dataset(
   universe_workspace="roboflow-universe-projects",
   universe_project="hard-hat-universe",
   version_number=1,
-  format="yolov8",
+  model_format="yolov8",
   location="./datasets/hard-hat"
 )
 ```
@@ -98,8 +99,18 @@ get_model_metrics(project_url="my-project", version_number=3)
 
 ---
 
+## Tests
+
+```bash
+python -m unittest test_server -v
+```
+
+21 tests covering output suppression, lazy init thread safety, input validation, null model guard, auth error propagation, and parameter contracts. No live API key required.
+
+---
+
 ## Implementation Notes
 
-- **Lazy authentication** — the Roboflow SDK authenticates once per session on first tool call.
-- **Stdout suppression** — the SDK prints to stdout on init, which corrupts MCP's stdio transport. All SDK calls are wrapped to redirect stdout.
+- **Lazy authentication** — the Roboflow SDK authenticates once per session on first tool call, with double-checked locking for thread safety.
+- **Output suppression** — the SDK prints to both stdout and stderr on init, which corrupts MCP's stdio transport. All SDK calls redirect both streams.
 - `search_universe` and `get_model_metrics` call the Roboflow REST API directly for endpoints not exposed cleanly through the SDK.
