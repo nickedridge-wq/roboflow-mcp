@@ -9,7 +9,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that ex
 **Requirements:** Python 3.10+, a Roboflow API key, Claude Code installed.
 
 ```bash
-git clone https://github.com/nickedridge-wq/roboflow-mcp.git
+git clone https://github.com/nickedridge-wq/Claude-Code-Dev-Templates.git
 cd roboflow-mcp
 python -m venv venv
 source venv/bin/activate
